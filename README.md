@@ -1,28 +1,31 @@
 # md_downloader
 
-Scans a markdown file for `[[paper]]` and `[[project]]` tags, downloads
-whatever URL follows each one, and writes a local copy of the markdown
-with every link pointing at the downloaded file instead of the internet.
+Makes a markdown file fully browsable offline. Every URL in the file gets
+downloaded and the link rewritten to point at the local copy — not just
+`[[paper]]`/`[[project]]` tagged ones, but every plain link too.
 
-## Expected format
+## What happens to each URL
 
-```markdown
-[[paper]] https://arxiv.org/abs/1706.03762
-[[project]] https://github.com/octocat/Hello-World
-```
+| URL is...                                                  | What happens                                            | Saved to              |
+|--------------------------------------------------------------|-----------------------------------------------------------|------------------------|
+| Tagged `[[paper]]`                                            | Forced: downloaded as a `.pdf`. arXiv `/abs/...` and OpenReview `forum?id=...` links are auto-resolved to their direct PDF URL first. | `downloads/papers/`   |
+| Tagged `[[project]]`                                          | Forced: the repo downloaded as a `.zip`                   | `downloads/projects/` |
+| A bare `github.com/owner/repo` or `huggingface.co/...` link (model, dataset, or space) — **no tag needed** | Auto-detected and downloaded as a `.zip` the same way      | `downloads/projects/` |
+| A URL with a known file extension (`.pdf`, `.png`, `.csv`, `.py`, `.safetensors`, ...) | Downloaded directly as that file                          | `downloads/files/`    |
+| Anything else                                                  | Fetched once; if the response is HTML it's saved as a webpage (with a `<base>` tag so relative images/css/js still resolve), otherwise saved as whatever it actually turned out to be, based on the real `Content-Type` header — never just guessed from the URL | `downloads/html/` or `downloads/files/` |
 
-The URL can be on the same line or the next line — whichever comes first
-after the tag is what gets downloaded. Tags are case-insensitive and also
-accept the plural form (`[[papers]]`, `[[projects]]`).
+`[[paper]]`/`[[project]]` tags can have the URL on the same line or the
+next line. Links that fail to download are left pointing at their
+original URL — nothing is silently dropped.
 
-| Tag           | What happens                                                                 | Saved to              |
-|---------------|-------------------------------------------------------------------------------|------------------------|
-| `[[paper]]`   | Downloaded as a `.pdf`. arXiv `/abs/...` links are auto-resolved to `/pdf/...`, OpenReview `forum?id=...` links to `pdf?id=...`. If the result doesn't actually look like a PDF, it's saved under the correct extension anyway and a warning is printed — never silently mislabeled. | `downloads/papers/`   |
-| `[[project]]` | The GitHub repo, downloaded as a `.zip` (via codeload.github.com)             | `downloads/projects/` |
+### Hugging Face repos specifically
 
-Any other plain markdown links (`[text](url)`, `<url>`) elsewhere in the file
-are also picked up and downloaded — classified as a github repo / known file
-type / webpage — so nothing in the file gets silently skipped.
+GitHub has a single "give me a zip" endpoint; Hugging Face doesn't, so this
+tool lists every file via the Hub API and zips them itself. To avoid a
+"download model repo" link accidentally pulling down tens of GB of weights,
+any individual file over **200MB** is skipped by default (the zip still
+gets the actual source: README, configs, tokenizer files, small assets).
+Raise or remove the cap with `--hf-max-file-mb`.
 
 ## Quick start
 
@@ -32,44 +35,37 @@ chmod +x run.sh        # only needed once
 ```
 
 `run.sh` creates an isolated `.venv/` on first run and installs dependencies
-into it automatically — no manual `pip install` needed, and your system
-Python is untouched. Later runs reuse the same venv and skip straight to
-execution.
+into it automatically. Later runs reuse it and skip straight to execution.
 
 ## What you get
 
 ```
 notes_offline/
-├── notes.md              <- local copy, [[paper]]/[[project]] URLs replaced
-├── manifest.json          <- status of every link (ok / error, with reason)
+├── notes.md              <- local copy, every URL replaced with a local path
+├── manifest.json          <- status of every link (ok/error, content-type, etc.)
 └── downloads/
     ├── papers/             <- [[paper]] links, as .pdf
-    ├── projects/           <- [[project]] links, as .zip
-    ├── repos/              <- other bare github.com links, as .zip
-    ├── files/               <- other links with a known file extension
-    └── html/                <- other links (saved webpages)
+    ├── projects/           <- repo links (github/huggingface), as .zip
+    ├── files/              <- anything that turned out to be a file
+    └── html/               <- anything that turned out to be a webpage
 ```
-
-Open `notes_offline/notes.md` — every `[[paper]]`/`[[project]]` line now
-points at the file on disk, so it opens locally with no internet needed.
-Links that failed to download are left pointing at their original URL.
 
 ## Options
 
 ```bash
 ./run.sh notes.md ./notes_offline \
   --workers 8 \                   # concurrent downloads
-  --branch main \                 # force a branch for ALL [[project]]/repo links
+  --branch main \                 # force a branch/revision for ALL repo links
   --github-token $GITHUB_TOKEN \  # raise GitHub's rate limit (60/hr -> 5000/hr)
+  --hf-max-file-mb 500 \          # raise the per-file cap for Hugging Face zips
   --timeout 30 \
   --dry-run \                     # just show classification, download nothing (output_dir not required)
   -v                               # verbose logging
 ```
 
 `GITHUB_TOKEN` can also be set as an environment variable. Without one,
-GitHub's unauthenticated API limit is 60 requests/hour — fine for a few
-repos, but get a token (no scopes needed, just a classic PAT) if your file
-has many `[[project]]` links whose default branch needs to be looked up.
+GitHub's unauthenticated API limit is 60 requests/hour — get a token
+(no scopes needed, just a classic PAT) if your file links many repos.
 
 ## Manual install (without run.sh)
 
@@ -80,12 +76,11 @@ python md_downloader.py notes.md ./notes_offline
 
 ## Known limitations (by design, kept simple)
 
-- `[[project]]` only supports GitHub repos.
+- Repo zip support covers github.com and huggingface.co. Other git hosts
+  (GitLab, Bitbucket) aren't recognized and fall through to the generic
+  file/html handling.
 - PDF resolution has explicit rules for arXiv and OpenReview; other paper
-  hosts are downloaded as-is (most academic PDF hosts serve the file
-  directly with no landing page, so this covers the common case).
+  hosts are downloaded as-is, which works for any host that serves the PDF
+  directly (most do) but not for hosts with a JS-gated download flow.
 - HTML pages are saved as the raw server response (no JS execution) — fine
   for most docs/articles, not for JS-rendered SPAs.
-- Reference-style markdown links (`[text][ref]` + `[ref]: url`) aren't parsed
-  for the *generic* fallback path (the `[[paper]]`/`[[project]]` path doesn't
-  care about link style at all, since it just looks for the next URL).

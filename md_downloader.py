@@ -2,37 +2,40 @@
 """
 md_downloader.py
 
-Scans a markdown file for [[paper]] / [[project]] tags. The URL that
-follows each tag is downloaded:
+Downloads EVERY url in a markdown file so the file can be browsed fully
+offline, deciding what to do with each one:
 
-    [[paper]]   -> the linked document, saved as a .pdf
-                   (arXiv /abs/ links and OpenReview /forum links are
-                   automatically resolved to their direct PDF URL first)
-    [[project]] -> the linked GitHub repo, saved as a .zip
-
-Any other plain markdown links ([text](url) or <url>) elsewhere in the
-file are still downloaded too, classified generically (github repo / known
-file extension / webpage HTML) -- so nothing in the file is ignored.
+    [[paper]]   tag  -> forced: download as a .pdf (arXiv/OpenReview
+                        landing pages are resolved to their direct PDF URL)
+    [[project]] tag  -> forced: download the repo (github.com or
+                        huggingface.co) as a .zip
+    any bare github.com or huggingface.co repo link (no tag needed)
+                      -> also downloaded as a .zip, same as [[project]]
+    a URL with a known file extension (.pdf, .png, .csv, .py, ...)
+                      -> downloaded as that file
+    anything else     -> fetched once; if the response is HTML it's saved
+                        as a webpage (with a <base> tag so relative
+                        images/css/js still resolve), otherwise it's
+                        saved as whatever file it actually is, based on
+                        the real Content-Type -- not a guess from the URL
 
 A local copy of the markdown is then written with every URL replaced by
-the path to its local download, so you can open that file and every link
-opens something on disk -- no internet required.
+the path to its local download.
 
 Usage:
     python md_downloader.py notes.md ./notes_offline
     python md_downloader.py notes.md ./notes_offline --dry-run
-    GITHUB_TOKEN=ghp_xxx python md_downloader.py notes.md ./notes_offline   # higher GitHub rate limit
+    GITHUB_TOKEN=ghp_xxx python md_downloader.py notes.md ./notes_offline
 
 Result:
     notes_offline/
         notes.md              <- local copy, links rewritten
-        manifest.json          <- per-link status (ok/error)
+        manifest.json          <- per-link status (ok/error/content-type)
         downloads/
             papers/             <- [[paper]] links, as .pdf
-            projects/           <- [[project]] links, as .zip
-            repos/              <- any other bare github.com repo links, as .zip
-            files/              <- any other links with a known file extension
-            html/               <- any other links (saved webpages)
+            projects/           <- repo links (github/huggingface), as .zip
+            files/              <- anything that turned out to be a file
+            html/               <- anything that turned out to be a webpage
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ import mimetypes
 import os
 import re
 import sys
+import tempfile
+import zipfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -60,23 +65,14 @@ log = logging.getLogger("md_downloader")
 # Patterns
 # --------------------------------------------------------------------------
 
-# [[paper]] or [[project]] (singular/plural, case-insensitive)
 TAG_RE = re.compile(r"\[\[\s*(?P<tag>papers?|projects?)\s*\]\]", re.IGNORECASE)
-
-# A bare URL, used to find "the next URL after a tag"
 URL_RE = re.compile(r"https?://[^\s\)>\]]+")
 
-# Generic fallback: [text](url) / ![alt](url)
 MD_LINK_RE = re.compile(
     r'(?P<bang>!?)\[(?P<text>[^\]]*)\]\((?P<url>[^)\s]+)(?P<title>\s+"[^"]*")?\)'
 )
-# Generic fallback: <https://example.com>
 AUTOLINK_RE = re.compile(r"<(?P<url>https?://[^>\s]+)>")
 
-GITHUB_REPO_RE = re.compile(
-    r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+?)(?:\.git)?"
-    r"(?:/(?:tree|commits)/(?P<branch>[^/?#]+)/?)?$"
-)
 GITHUB_BLOB_RE = re.compile(
     r"^https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/blob/"
     r"(?P<branch>[^/]+)/(?P<path>[^?#]+)"
@@ -91,13 +87,22 @@ FILE_EXTENSIONS = {
     ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx",
     ".py", ".js", ".ts", ".java", ".c", ".cpp", ".go", ".rs", ".sh",
     ".whl", ".jar", ".exe", ".dmg", ".deb", ".apk", ".gitignore",
+    ".safetensors", ".bin", ".onnx", ".pt", ".ckpt", ".h5", ".parquet",
 }
+
+HF_NON_REPO_TOP_LEVEL = {
+    "models", "datasets", "spaces", "blog", "docs", "papers", "learn",
+    "course", "pricing", "join", "login", "settings", "about", "tasks",
+    "search", "collections", "posts", "organizations",
+}
+HF_STOP_KEYWORDS = {"tree", "blob", "resolve", "commit", "commits", "discussions", "raw", "blame", "edit"}
 
 DEFAULT_HEADERS = {
     "User-Agent": "md-downloader/1.0 (+https://github.com)",
 }
 
-MAX_TAG_SEARCH_WINDOW = 500  # chars to look ahead of a tag for its URL
+HTML_CONTENT_TYPES = {"text/html", "application/xhtml+xml"}
+MAX_TAG_SEARCH_WINDOW = 500
 
 
 # --------------------------------------------------------------------------
@@ -107,7 +112,7 @@ MAX_TAG_SEARCH_WINDOW = 500  # chars to look ahead of a tag for its URL
 @dataclass
 class LinkItem:
     url: str
-    kind: str = ""              # paper | project_repo | github_repo | file | html | skip
+    kind: str = ""              # paper | project | repo | file | auto | skip
     local_path: Path | None = None
     status: str = "pending"     # pending | ok | error
     error: str = ""
@@ -118,18 +123,16 @@ class LinkItem:
 # [[paper]] / [[project]] extraction
 # --------------------------------------------------------------------------
 
-def find_tag_links(md_text: str) -> list[dict]:
-    """Find [[paper]]/[[project]] tags and the URL that follows each one.
+def _spans_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] < b[1] and b[0] < a[1]
 
-    Returns a list of {tag, url, span} dicts, span = (start, end) of the
-    URL substring's position in md_text (for precise in-place rewriting).
-    """
+
+def find_tag_links(md_text: str) -> list[dict]:
     tag_matches = list(TAG_RE.finditer(md_text))
     results = []
     for idx, tm in enumerate(tag_matches):
         window_end = tag_matches[idx + 1].start() if idx + 1 < len(tag_matches) else len(md_text)
         window_end = min(window_end, tm.end() + MAX_TAG_SEARCH_WINDOW)
-        # Don't reach across a paragraph break looking for the URL.
         para_break = re.search(r"\n\s*\n", md_text[tm.end():window_end])
         if para_break:
             window_end = tm.end() + para_break.start()
@@ -144,39 +147,113 @@ def find_tag_links(md_text: str) -> list[dict]:
         abs_start = tm.end() + um.start()
         abs_end = abs_start + len(url)
         tag = tm.group("tag").lower()
-        kind = "paper" if tag.startswith("paper") else "project_repo"
+        kind = "paper" if tag.startswith("paper") else "project"
         results.append({"kind": kind, "url": url, "span": (abs_start, abs_end)})
     return results
 
 
-def find_generic_links(md_text: str, exclude_urls: set[str]) -> list[dict]:
-    """Plain [text](url) / <url> links, skipping anything already tag-handled."""
-    results = []
+def extract_all_links(md_text: str) -> list[dict]:
+    """Single overlap-aware pass: [[tag]] urls, then [text](url)/<url>, then any
+    remaining bare https?:// URL in the text. Every URL in the file is returned
+    exactly once, each with a non-overlapping span for safe in-place rewriting.
+    """
+    results: list[dict] = []
+    consumed: list[tuple[int, int]] = []
+
+    for lk in find_tag_links(md_text):
+        results.append(lk)
+        consumed.append(lk["span"])
+
     for m in MD_LINK_RE.finditer(md_text):
         raw = m.group("url")
         url = raw.strip("<>")
-        if url in exclude_urls:
+        if not url.startswith(("http://", "https://")):
             continue
         s, e = m.span("url")
         if raw.startswith("<") and raw.endswith(">"):
             s, e = s + 1, e - 1
-        results.append({"kind": None, "url": url, "span": (s, e)})
-    for m in AUTOLINK_RE.finditer(md_text):
-        url = m.group("url")
-        if url in exclude_urls:
+        if any(_spans_overlap((s, e), c) for c in consumed):
             continue
-        results.append({"kind": None, "url": url, "span": m.span("url")})
+        results.append({"kind": None, "url": url, "span": (s, e)})
+        consumed.append((s, e))
+
+    for m in AUTOLINK_RE.finditer(md_text):
+        s, e = m.span("url")
+        if any(_spans_overlap((s, e), c) for c in consumed):
+            continue
+        results.append({"kind": None, "url": m.group("url"), "span": (s, e)})
+        consumed.append((s, e))
+
+    for m in URL_RE.finditer(md_text):
+        url = m.group(0).rstrip(".,;:)]>")
+        s = m.start()
+        e = s + len(url)
+        if any(_spans_overlap((s, e), c) for c in consumed):
+            continue
+        results.append({"kind": None, "url": url, "span": (s, e)})
+        consumed.append((s, e))
+
     return results
 
 
+# --------------------------------------------------------------------------
+# Repo host detection (github.com / huggingface.co)
+# --------------------------------------------------------------------------
+
+def parse_hf_repo(url: str) -> dict | None:
+    """Parse a huggingface.co URL into repo_type/api_prefix/url_prefix/repo_id/revision."""
+    parsed = urlsplit(url)
+    if parsed.netloc.lower() not in ("huggingface.co", "www.huggingface.co"):
+        return None
+    parts = [p for p in parsed.path.split("/") if p]
+    if not parts:
+        return None
+
+    repo_type, api_prefix, url_prefix = "model", "models", ""
+    if parts[0] == "datasets":
+        repo_type, api_prefix, url_prefix = "dataset", "datasets", "datasets/"
+        parts = parts[1:]
+    elif parts[0] == "spaces":
+        repo_type, api_prefix, url_prefix = "space", "spaces", "spaces/"
+        parts = parts[1:]
+
+    if not parts or parts[0] in HF_NON_REPO_TOP_LEVEL:
+        return None
+
+    id_parts, revision = [], None
+    for i, p in enumerate(parts):
+        if p in HF_STOP_KEYWORDS:
+            if i + 1 < len(parts):
+                revision = parts[i + 1]
+            break
+        id_parts.append(p)
+    if not id_parts:
+        return None
+
+    return {
+        "repo_type": repo_type, "api_prefix": api_prefix, "url_prefix": url_prefix,
+        "repo_id": "/".join(id_parts), "revision": revision,
+    }
+
+
+def detect_repo_host(url: str) -> str | None:
+    """Return 'github' / 'huggingface' if url looks like a repo root, else None."""
+    parsed = urlsplit(url)
+    netloc = parsed.netloc.lower()
+    if netloc in ("github.com", "www.github.com"):
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2:
+            return "github"
+        return None
+    if parse_hf_repo(url) is not None:
+        return "huggingface"
+    return None
+
+
 def classify_generic(url: str) -> tuple[str, dict]:
-    """Classify a plain (non-tagged) link: github_repo | file | html | skip."""
+    """skip | file | repo | auto -- for any URL not under a [[paper]]/[[project]] tag."""
     if not url.startswith(("http://", "https://")):
         return "skip", {}
-
-    m = GITHUB_REPO_RE.match(url)
-    if m:
-        return "github_repo", {"owner": m.group("owner"), "repo": m.group("repo"), "branch": m.group("branch")}
 
     m = GITHUB_BLOB_RE.match(url)
     if m:
@@ -186,15 +263,17 @@ def classify_generic(url: str) -> tuple[str, dict]:
         )
         return "file", {"raw_url": raw_url}
 
+    if detect_repo_host(url):
+        return "repo", {}
+
     ext = Path(urlsplit(url).path).suffix.lower()
     if ext in FILE_EXTENSIONS:
         return "file", {}
 
-    return "html", {}
+    return "auto", {}
 
 
 def resolve_pdf_url(url: str) -> str:
-    """Turn an arXiv/OpenReview landing-page URL into its direct PDF URL."""
     parts = urlsplit(url)
     host = parts.netloc.lower()
     path = parts.path
@@ -253,19 +332,20 @@ def derive_slug(url: str) -> str:
 
 class Downloader:
     def __init__(self, out_dir: Path, github_token: str | None, timeout: int,
-                 forced_branch: str | None = None):
+                 forced_branch: str | None = None, hf_max_file_mb: int = 200):
         self.out_dir = out_dir
         self.github_token = github_token
         self.timeout = timeout
         self.forced_branch = forced_branch
-        for sub in ("papers", "projects", "repos", "files", "html"):
+        self.hf_max_file_bytes = hf_max_file_mb * 1024 * 1024
+        self.hf_max_file_mb = hf_max_file_mb
+        for sub in ("papers", "projects", "files", "html"):
             (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    # ---- [[paper]] -> pdf -------------------------------------------------
+    # ---- [[paper]] -> pdf ---------------------------------------------------
     def download_paper(self, item: LinkItem) -> None:
         resolved = resolve_pdf_url(item.url)
-        headers = dict(DEFAULT_HEADERS)
-        with requests.get(resolved, headers=headers, stream=True,
+        with requests.get(resolved, headers=DEFAULT_HEADERS, stream=True,
                            timeout=self.timeout, allow_redirects=True) as r:
             r.raise_for_status()
             content_type = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
@@ -282,26 +362,32 @@ class Downloader:
         item.meta["looks_like_pdf"] = looks_like_pdf
         if not looks_like_pdf:
             log.warning(
-                "  -> %s did not look like a real PDF (content-type=%s); "
-                "saved as %s anyway, please check it manually",
+                "  -> %s did not look like a real PDF (content-type=%s); saved as %s anyway, please check it manually",
                 item.url, content_type or "unknown", dest.name,
             )
 
-    # ---- [[project]] -> github zip ----------------------------------------
-    def download_project(self, item: LinkItem) -> None:
+    # ---- [[project]] tag or bare repo link -> zip ---------------------------
+    def download_repo(self, item: LinkItem) -> None:
+        host = detect_repo_host(item.url)
+        if host == "github":
+            self._download_github_zip(item)
+        elif host == "huggingface":
+            self._download_hf_zip(item)
+        else:
+            raise ValueError(f"Unrecognized repo host (only github.com and huggingface.co are supported): {item.url}")
+
+    def _download_github_zip(self, item: LinkItem) -> None:
         parsed = urlsplit(item.url)
-        if "github.com" not in parsed.netloc.lower():
-            raise ValueError(f"Unsupported git host for [[project]] link (only github.com is supported): {item.url}")
         parts = [p for p in parsed.path.split("/") if p]
         if len(parts) < 2:
-            raise ValueError(f"Could not parse owner/repo from [[project]] link: {item.url}")
+            raise ValueError(f"Could not parse owner/repo from github link: {item.url}")
         owner, repo = parts[0], re.sub(r"\.git$", "", parts[1])
 
         branch = self.forced_branch
         if not branch and len(parts) >= 4 and parts[2] in ("tree", "commits"):
             branch = parts[3]
         if not branch:
-            branch = self._default_branch(owner, repo)
+            branch = self._github_default_branch(owner, repo)
 
         zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
         filename = sanitize(f"{owner}__{repo}__{branch}.zip")
@@ -310,20 +396,69 @@ class Downloader:
         item.local_path = dest
         item.meta["branch"] = branch
 
-    # ---- generic fallback: bare github repo link -> zip --------------------
-    def download_github_repo(self, item: LinkItem) -> None:
-        owner, repo = item.meta["owner"], item.meta["repo"]
-        branch = self.forced_branch or item.meta.get("branch")
-        if not branch:
-            branch = self._default_branch(owner, repo)
-        zip_url = f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branch}"
-        filename = sanitize(f"{owner}__{repo}__{branch}.zip")
-        dest = unique_path(self.out_dir / "repos", filename)
-        self._stream_to_file(zip_url, dest)
-        item.local_path = dest
-        item.meta["branch"] = branch
+    def _download_hf_zip(self, item: LinkItem) -> None:
+        info = parse_hf_repo(item.url)
+        if info is None:
+            raise ValueError(f"Could not parse a Hugging Face repo id from: {item.url}")
 
-    # ---- generic fallback: direct file -------------------------------------
+        revision = self.forced_branch or info["revision"] or "main"
+        api_url = f"https://huggingface.co/api/{info['api_prefix']}/{info['repo_id']}"
+        if revision != "main":
+            api_url += f"/revision/{revision}"
+        r = requests.get(api_url, headers=DEFAULT_HEADERS, timeout=self.timeout)
+        r.raise_for_status()
+        siblings = r.json().get("siblings", [])
+        if not siblings:
+            raise ValueError(f"No files listed for Hugging Face repo {info['repo_id']} (gated, private, or empty?)")
+
+        included, skipped = [], []
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            for sib in siblings:
+                rfilename = sib.get("rfilename")
+                if not rfilename:
+                    continue
+                file_url = f"https://huggingface.co/{info['url_prefix']}{info['repo_id']}/resolve/{revision}/{rfilename}"
+                try:
+                    with requests.get(file_url, headers=DEFAULT_HEADERS, stream=True,
+                                       timeout=self.timeout, allow_redirects=True) as fr:
+                        fr.raise_for_status()
+                        size = int(fr.headers.get("Content-Length") or 0)
+                        if size > self.hf_max_file_bytes:
+                            skipped.append(rfilename)
+                            continue
+                        dest_file = tmp_path / rfilename
+                        dest_file.parent.mkdir(parents=True, exist_ok=True)
+                        with open(dest_file, "wb") as f:
+                            for chunk in fr.iter_content(chunk_size=1 << 16):
+                                if chunk:
+                                    f.write(chunk)
+                        included.append(rfilename)
+                except requests.RequestException as exc:
+                    log.warning("  -> failed to fetch %s from %s (%s), skipping that file", rfilename, info["repo_id"], exc)
+                    skipped.append(rfilename)
+
+            if not included:
+                raise ValueError(f"All files in {info['repo_id']} were skipped (too large or failed) -- nothing to zip")
+
+            safe_name = sanitize(info["repo_id"].replace("/", "__"))
+            filename = f"{safe_name}__{revision}__hf.zip"
+            dest = unique_path(self.out_dir / "projects", filename)
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+                for rel in included:
+                    zf.write(tmp_path / rel, arcname=rel)
+
+        item.local_path = dest
+        item.meta["revision"] = revision
+        item.meta["files_included"] = len(included)
+        item.meta["files_skipped"] = len(skipped)
+        if skipped:
+            log.info(
+                "  -> %s: zipped %d file(s), skipped %d over %dMB cap (--hf-max-file-mb to change), e.g. %s",
+                item.url, len(included), len(skipped), self.hf_max_file_mb, skipped[0],
+            )
+
+    # ---- known-extension file -------------------------------------------------
     def download_file(self, item: LinkItem) -> None:
         url = item.meta.get("raw_url", item.url)
         base = os.path.basename(urlsplit(url).path) or short_hash(url)
@@ -334,31 +469,53 @@ class Downloader:
         self._stream_to_file(url, dest)
         item.local_path = dest
 
-    # ---- generic fallback: webpage -> html ----------------------------------
-    def download_html(self, item: LinkItem) -> None:
+    # ---- "auto": sniff Content-Type once, decide file vs html -----------------
+    def download_auto(self, item: LinkItem) -> None:
         headers = dict(DEFAULT_HEADERS)
-        headers["Accept"] = "text/html,application/xhtml+xml"
-        r = requests.get(item.url, headers=headers, timeout=self.timeout)
-        r.raise_for_status()
+        headers["Accept"] = "*/*"
+        with requests.get(item.url, headers=headers, stream=True,
+                          timeout=self.timeout, allow_redirects=True) as r:
+            r.raise_for_status()
+            content_type = r.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            item.meta["content_type"] = content_type or "unknown"
 
-        soup = BeautifulSoup(r.text, "html.parser")
+            if content_type in HTML_CONTENT_TYPES:
+                dest = self._save_html(item.url, r.text)
+                item.kind = "html"
+            else:
+                ext = mimetypes.guess_extension(content_type) if content_type else None
+                if not ext:
+                    ext = Path(urlsplit(item.url).path).suffix or ".bin"
+                base = os.path.basename(urlsplit(item.url).path) or short_hash(item.url)
+                stem = sanitize(Path(base).stem or "file")
+                filename = f"{stem}{ext}"
+                dest = unique_path(self.out_dir / "files", filename)
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 16):
+                        if chunk:
+                            f.write(chunk)
+                item.kind = "file"
+        item.local_path = dest
+
+    # ---- shared helpers ---------------------------------------------------------
+    def _save_html(self, url: str, html_text: str) -> Path:
+        soup = BeautifulSoup(html_text, "html.parser")
         if soup.head is None:
             head = soup.new_tag("head")
             if soup.html:
                 soup.html.insert(0, head)
             else:
                 soup.insert(0, head)
-        soup.head.insert(0, soup.new_tag("base", href=item.url))
+        soup.head.insert(0, soup.new_tag("base", href=url))
 
-        parsed = urlsplit(item.url)
+        parsed = urlsplit(url)
         slug = sanitize(f"{parsed.netloc}{parsed.path}") or "page"
-        filename = f"{slug}_{short_hash(item.url)}.html"
+        filename = f"{slug}_{short_hash(url)}.html"
         dest = unique_path(self.out_dir / "html", filename)
         dest.write_text(str(soup), encoding="utf-8")
-        item.local_path = dest
+        return dest
 
-    # ---- shared helpers -----------------------------------------------------
-    def _default_branch(self, owner: str, repo: str) -> str:
+    def _github_default_branch(self, owner: str, repo: str) -> str:
         headers = dict(DEFAULT_HEADERS)
         if self.github_token:
             headers["Authorization"] = f"Bearer {self.github_token}"
@@ -381,14 +538,12 @@ class Downloader:
         try:
             if item.kind == "paper":
                 self.download_paper(item)
-            elif item.kind == "project_repo":
-                self.download_project(item)
-            elif item.kind == "github_repo":
-                self.download_github_repo(item)
+            elif item.kind in ("project", "repo"):
+                self.download_repo(item)
             elif item.kind == "file":
                 self.download_file(item)
-            elif item.kind == "html":
-                self.download_html(item)
+            elif item.kind == "auto":
+                self.download_auto(item)
             item.status = "ok"
             log.info("OK   [%s] %s -> %s", item.kind, item.url, item.local_path)
         except Exception as exc:  # noqa: BLE001
@@ -407,7 +562,6 @@ def rewrite_markdown(md_text: str, all_links: list[dict], url_to_rel: dict[str, 
         (lk["span"][0], lk["span"][1], url_to_rel[lk["url"]])
         for lk in all_links if lk["url"] in url_to_rel
     ]
-    # Apply right-to-left so earlier spans' positions stay valid.
     replacements.sort(key=lambda t: t[0], reverse=True)
     text = md_text
     for start, end, replacement in replacements:
@@ -432,7 +586,10 @@ def main() -> int:
     parser.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN"),
                          help="GitHub token to raise API/rate limits (or set GITHUB_TOKEN env var)")
     parser.add_argument("--branch", default=None,
-                         help="Force this branch for ALL github repo/[[project]] links")
+                         help="Force this branch/revision for ALL repo links (github and huggingface)")
+    parser.add_argument("--hf-max-file-mb", type=int, default=200,
+                         help="Skip individual files in a Hugging Face repo larger than this "
+                              "many MB (e.g. model weights) when building its zip. Default 200.")
     parser.add_argument("--timeout", type=int, default=30, help="Per-request timeout (s)")
     parser.add_argument("--dry-run", action="store_true",
                          help="Only show classification, don't download anything")
@@ -450,24 +607,21 @@ def main() -> int:
         return 1
     md_text = md_path.read_text(encoding="utf-8")
 
-    tag_links = find_tag_links(md_text)
-    tag_urls = {lk["url"] for lk in tag_links}
-    generic_links = find_generic_links(md_text, exclude_urls=tag_urls)
-    all_links = tag_links + generic_links
+    all_links = extract_all_links(md_text)
 
-    # Build the de-duplicated download list (one item per unique URL).
     items_by_url: dict[str, LinkItem] = {}
-    for lk in tag_links:
-        if lk["url"] not in items_by_url:
+    for lk in all_links:
+        if lk["url"] in items_by_url:
+            continue
+        if lk["kind"] is not None:
             items_by_url[lk["url"]] = LinkItem(url=lk["url"], kind=lk["kind"])
-    for lk in generic_links:
-        if lk["url"] not in items_by_url:
+        else:
             kind, meta = classify_generic(lk["url"])
             items_by_url[lk["url"]] = LinkItem(url=lk["url"], kind=kind, meta=meta)
     items = list(items_by_url.values())
 
     if not items:
-        log.info("No links found in %s (looking for [[paper]]/[[project]] tags and plain markdown links)", md_path)
+        log.info("No links found in %s", md_path)
         return 0
 
     counts = Counter(i.kind for i in items)
@@ -475,25 +629,27 @@ def main() -> int:
 
     if args.dry_run:
         for i in items:
-            print(f"  [{i.kind:13s}] {i.url}")
+            print(f"  [{i.kind:9s}] {i.url}")
         return 0
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     downloads_dir = out_dir / "downloads"
-    downloader = Downloader(downloads_dir, args.github_token, args.timeout, args.branch)
+    downloader = Downloader(downloads_dir, args.github_token, args.timeout, args.branch, args.hf_max_file_mb)
 
     downloadable = [i for i in items if i.kind != "skip"]
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {pool.submit(downloader.run, item): item for item in downloadable}
         for _ in as_completed(futures):
-            pass  # progress already logged inside Downloader.run
+            pass
 
     output_md = out_dir / md_path.name
     url_to_rel: dict[str, str] = {}
     manifest = {}
     for item in items:
-        entry = {"kind": item.kind, "status": item.status, "error": item.error}
+        entry = {"kind": item.kind, "status": item.status, "error": item.error, **{
+            k: v for k, v in item.meta.items() if isinstance(v, (str, int, float, bool))
+        }}
         if item.local_path is not None:
             rel = Path(os.path.relpath(item.local_path, start=output_md.parent)).as_posix()
             url_to_rel[item.url] = rel
