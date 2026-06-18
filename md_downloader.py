@@ -250,10 +250,25 @@ def detect_repo_host(url: str) -> str | None:
     return None
 
 
+def is_pdf_landing_page(url: str) -> bool:
+    """True for arXiv abs/pdf pages and OpenReview forum links that should fetch a PDF."""
+    parts = urlsplit(url)
+    host = parts.netloc.lower()
+    path = parts.path
+    if host.endswith("arxiv.org") and (path.startswith("/abs/") or path.startswith("/pdf/")):
+        return True
+    if host.endswith("openreview.net") and path.startswith("/forum"):
+        return True
+    return False
+
+
 def classify_generic(url: str) -> tuple[str, dict]:
     """skip | file | repo | auto -- for any URL not under a [[paper]]/[[project]] tag."""
     if not url.startswith(("http://", "https://")):
         return "skip", {}
+
+    if is_pdf_landing_page(url):
+        return "paper", {}
 
     m = GITHUB_BLOB_RE.match(url)
     if m:
