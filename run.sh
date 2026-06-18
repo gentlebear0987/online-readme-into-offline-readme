@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
 # run.sh - bootstrap a venv (first run only) and execute md_downloader.py
 #
-# Looks for [[paper]] and [[project]] tags in your markdown file and
-# downloads the URL that follows each one (paper -> .pdf, project -> .zip).
+# Downloads every URL in markdown file(s) for fully offline browsing.
 #
 # Usage:
 #   ./run.sh notes.md ./notes_offline
-#   ./run.sh notes.md ./notes_offline --branch main --github-token $GITHUB_TOKEN
-#   ./run.sh notes.md --dry-run            # output dir not needed for a dry run
+#   ./run.sh notes.md                              # writes <parent>_1.zip
+#   ./run.sh "'a.zip', 'b/README.md', c'"         # multiple inputs in parallel
+#   ./run.sh notes.md --dry-run
+#   ./run.sh notes.md ./out --jobs 4 --workers 8
 #
-# Arg 1: path to your markdown file
-# Arg 2: path to the (new) directory to create with the local markdown
-#        copy + downloads/ folder
+# Arg 1: one or more inputs (comma-separated, quote-aware):
+#        .md file, folder with a .md, or .zip (extracted for README.md)
+# Arg 2: (optional) output directory. If omitted, each input becomes a
+#        <parent-folder>_1.zip beside that folder.
 #
-# Any extra flags are forwarded as-is to md_downloader.py.
+# Extra flags are forwarded to md_downloader.py.
 
 set -euo pipefail
 

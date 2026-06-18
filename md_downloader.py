@@ -9,8 +9,14 @@ offline, deciding what to do with each one:
                         landing pages are resolved to their direct PDF URL)
     [[project]] tag  -> forced: download the repo (github.com or
                         huggingface.co) as a .zip
-    any bare github.com or huggingface.co repo link (no tag needed)
-                      -> also downloaded as a .zip, same as [[project]]
+    bare arXiv / OpenReview links (no tag) -> same PDF handling as [[paper]]
+    any bare github.com repo link (no tag needed) -> downloaded as a .zip
+    huggingface.co links -> classified by type:
+        model   -> config/tokenizer/README zip (weights skipped)
+        dataset -> metadata and small data files
+        space   -> app source code zip
+        file    -> single file via /resolve/ or /tree/.../file
+        reference (docs/blog/papers) -> saved as HTML
     a URL with a known file extension (.pdf, .png, .csv, .py, ...)
                       -> downloaded as that file
     anything else     -> fetched once; if the response is HTML it's saved
@@ -24,6 +30,8 @@ the path to its local download.
 
 Usage:
     python md_downloader.py notes.md ./notes_offline
+    python md_downloader.py notes.md                    # writes ../<parent>_1.zip
+    python md_downloader.py "a.md, b.zip, c"            # comma-separated, quote-aware
     python md_downloader.py notes.md ./notes_offline --dry-run
     GITHUB_TOKEN=ghp_xxx python md_downloader.py notes.md ./notes_offline
 
@@ -32,10 +40,13 @@ Result:
         notes.md              <- local copy, links rewritten
         manifest.json          <- per-link status (ok/error/content-type)
         downloads/
-            papers/             <- [[paper]] links, as .pdf
-            projects/           <- repo links (github/huggingface), as .zip
-            files/              <- anything that turned out to be a file
-            html/               <- anything that turned out to be a webpage
+            papers/             <- PDFs
+            projects/           <- GitHub repo zips
+            hf_models/          <- Hugging Face models
+            hf_datasets/        <- Hugging Face datasets
+            hf_spaces/          <- Hugging Face Spaces
+            files/              <- direct file downloads
+            html/               <- webpages
 """
 
 from __future__ import annotations
@@ -47,6 +58,7 @@ import logging
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import tempfile
 import zipfile
@@ -93,9 +105,24 @@ FILE_EXTENSIONS = {
 HF_NON_REPO_TOP_LEVEL = {
     "models", "datasets", "spaces", "blog", "docs", "papers", "learn",
     "course", "pricing", "join", "login", "settings", "about", "tasks",
-    "search", "collections", "posts", "organizations",
+    "search", "collections", "posts", "organizations", "enterprise", "changelog",
 }
 HF_STOP_KEYWORDS = {"tree", "blob", "resolve", "commit", "commits", "discussions", "raw", "blame", "edit"}
+HF_FILE_KEYWORDS = {"resolve", "raw"}
+HF_NAV_KEYWORDS = {"tree", "blob", "commits", "commit", "discussions", "discussion", "blame", "edit"}
+
+HF_MODEL_SKIP_EXT = {".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".h5", ".onnx", ".msgpack", ".gguf"}
+HF_DATASET_PREFER_EXT = {".md", ".json", ".py", ".csv", ".parquet", ".txt", ".yaml", ".yml", ".tsv", ".arrow"}
+HF_SPACE_PREFER_EXT = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".html", ".css", ".md", ".txt", ".json",
+    ".yaml", ".yml", ".toml", ".sh", ".ipynb", ".dockerfile", ".gradle", ".java",
+}
+
+HF_CATEGORY_DIRS = {
+    "model": "hf_models",
+    "dataset": "hf_datasets",
+    "space": "hf_spaces",
+}
 
 DEFAULT_HEADERS = {
     "User-Agent": "md-downloader/1.0 (+https://github.com)",
@@ -117,6 +144,18 @@ class LinkItem:
     status: str = "pending"     # pending | ok | error
     error: str = ""
     meta: dict = field(default_factory=dict)
+
+
+@dataclass
+class ResolvedInput:
+    md_path: Path
+    source_zip: Path | None = None
+    cleanup_dirs: list[Path] = field(default_factory=list)
+
+    def output_basename(self) -> str:
+        if self.source_zip is not None:
+            return self.source_zip.stem
+        return self.md_path.parent.name
 
 
 # --------------------------------------------------------------------------
@@ -200,40 +239,151 @@ def extract_all_links(md_text: str) -> list[dict]:
 # Repo host detection (github.com / huggingface.co)
 # --------------------------------------------------------------------------
 
-def parse_hf_repo(url: str) -> dict | None:
-    """Parse a huggingface.co URL into repo_type/api_prefix/url_prefix/repo_id/revision."""
-    parsed = urlsplit(url)
-    if parsed.netloc.lower() not in ("huggingface.co", "www.huggingface.co"):
-        return None
-    parts = [p for p in parsed.path.split("/") if p]
+def _hf_host(url: str) -> bool:
+    return urlsplit(url).netloc.lower() in ("huggingface.co", "www.huggingface.co")
+
+
+def _hf_repo_prefix(parts: list[str]) -> tuple[str, str, str, int]:
+    """Return (repo_type, api_prefix, url_prefix, start_index)."""
     if not parts:
-        return None
-
-    repo_type, api_prefix, url_prefix = "model", "models", ""
+        return "model", "models", "", 0
     if parts[0] == "datasets":
-        repo_type, api_prefix, url_prefix = "dataset", "datasets", "datasets/"
-        parts = parts[1:]
-    elif parts[0] == "spaces":
-        repo_type, api_prefix, url_prefix = "space", "spaces", "spaces/"
-        parts = parts[1:]
+        return "dataset", "datasets", "datasets/", 1
+    if parts[0] == "spaces":
+        return "space", "spaces", "spaces/", 1
+    return "model", "models", "", 0
 
-    if not parts or parts[0] in HF_NON_REPO_TOP_LEVEL:
-        return None
 
-    id_parts, revision = [], None
-    for i, p in enumerate(parts):
-        if p in HF_STOP_KEYWORDS:
-            if i + 1 < len(parts):
-                revision = parts[i + 1]
-            break
-        id_parts.append(p)
-    if not id_parts:
-        return None
-
+def _hf_repo_info(repo_type: str, api_prefix: str, url_prefix: str,
+                  repo_id: str, revision: str | None) -> dict:
     return {
-        "repo_type": repo_type, "api_prefix": api_prefix, "url_prefix": url_prefix,
-        "repo_id": "/".join(id_parts), "revision": revision,
+        "repo_type": repo_type,
+        "api_prefix": api_prefix,
+        "url_prefix": url_prefix,
+        "repo_id": repo_id,
+        "revision": revision,
     }
+
+
+def classify_hf_url(url: str) -> tuple[str, dict] | None:
+    """Classify a huggingface.co URL.
+
+    Returns (kind, meta) where kind is:
+      repo      -> model / dataset / space repository (zip selected files)
+      file      -> single file via /resolve/ or /tree/.../file
+      reference -> docs, blog, papers, discussions, etc. (save as HTML)
+    meta includes hf_category: model | dataset | space | reference
+    """
+    if not _hf_host(url):
+        return None
+
+    parts = [p for p in urlsplit(url).path.split("/") if p]
+    if not parts:
+        return "reference", {"hf_category": "reference"}
+
+    repo_type, api_prefix, url_prefix, idx = _hf_repo_prefix(parts)
+    rest = parts[idx:]
+
+    if parts[0] in HF_NON_REPO_TOP_LEVEL:
+        if parts[0] in ("datasets", "spaces") and rest:
+            pass  # e.g. /datasets/squad or /spaces/org/name — repo, not a listing page
+        else:
+            return "reference", {"hf_category": "reference", "hf_section": parts[0]}
+
+    if not rest:
+        return "reference", {"hf_category": "reference", "hf_section": repo_type}
+
+    for i, part in enumerate(rest):
+        if part in HF_FILE_KEYWORDS:
+            if i + 2 < len(rest):
+                repo_id = "/".join(rest[:i])
+                revision = rest[i + 1]
+                file_path = "/".join(rest[i + 2:])
+                raw_url = (
+                    f"https://huggingface.co/{url_prefix}{repo_id}"
+                    f"/resolve/{revision}/{file_path}"
+                )
+                return "file", {
+                    "hf_category": repo_type,
+                    "hf_file": file_path,
+                    "raw_url": raw_url,
+                    "hf_info": _hf_repo_info(repo_type, api_prefix, url_prefix, repo_id, revision),
+                }
+            break
+
+        if part in ("tree", "blob"):
+            if i + 1 < len(rest):
+                repo_id = "/".join(rest[:i])
+                revision = rest[i + 1]
+                if i + 2 < len(rest):
+                    file_path = "/".join(rest[i + 2:])
+                    raw_url = (
+                        f"https://huggingface.co/{url_prefix}{repo_id}"
+                        f"/resolve/{revision}/{file_path}"
+                    )
+                    return "file", {
+                        "hf_category": repo_type,
+                        "hf_file": file_path,
+                        "raw_url": raw_url,
+                        "hf_info": _hf_repo_info(repo_type, api_prefix, url_prefix, repo_id, revision),
+                    }
+                return "repo", {
+                    "hf_category": repo_type,
+                    "hf_info": _hf_repo_info(repo_type, api_prefix, url_prefix, repo_id, revision),
+                }
+            break
+
+        if part in ("discussions", "discussion", "commits", "commit", "blame", "edit"):
+            return "reference", {"hf_category": "reference", "hf_section": part}
+
+    id_parts: list[str] = []
+    revision = None
+    for i, part in enumerate(rest):
+        if part in HF_STOP_KEYWORDS:
+            if i + 1 < len(rest):
+                revision = rest[i + 1]
+            break
+        id_parts.append(part)
+
+    if id_parts:
+        return "repo", {
+            "hf_category": repo_type,
+            "hf_info": _hf_repo_info(
+                repo_type, api_prefix, url_prefix, "/".join(id_parts), revision,
+            ),
+        }
+
+    return "reference", {"hf_category": "reference"}
+
+
+def should_include_hf_file(filename: str, size: int, category: str, max_bytes: int) -> bool:
+    if size > max_bytes:
+        return False
+    ext = Path(filename).suffix.lower()
+    name_lower = filename.lower()
+    if category == "model":
+        if ext in HF_MODEL_SKIP_EXT:
+            return False
+        return True
+    if category == "dataset":
+        if ext in HF_DATASET_PREFER_EXT or name_lower in ("readme.md", "dataset_infos.json"):
+            return True
+        return ext not in HF_MODEL_SKIP_EXT
+    if category == "space":
+        if ext in HF_SPACE_PREFER_EXT or name_lower in (
+            "dockerfile", "requirements.txt", "app.py", "package.json",
+        ):
+            return True
+        return ext not in HF_MODEL_SKIP_EXT
+    return True
+
+
+def parse_hf_repo(url: str) -> dict | None:
+    """Parse a huggingface.co repo URL (legacy helper; prefer classify_hf_url)."""
+    result = classify_hf_url(url)
+    if result is None or result[0] != "repo":
+        return None
+    return result[1].get("hf_info")
 
 
 def detect_repo_host(url: str) -> str | None:
@@ -245,9 +395,28 @@ def detect_repo_host(url: str) -> str | None:
         if len(parts) >= 2:
             return "github"
         return None
-    if parse_hf_repo(url) is not None:
+    hf = classify_hf_url(url)
+    if hf is not None and hf[0] == "repo":
         return "huggingface"
     return None
+
+
+def apply_hf_classification(url: str, kind: str | None, meta: dict) -> tuple[str, dict]:
+    """Merge Hugging Face-specific kind/meta into a link classification."""
+    hf = classify_hf_url(url)
+    if hf is None:
+        return kind or "auto", meta
+    hf_kind, hf_meta = hf
+    merged = {**meta, **hf_meta}
+    if kind == "paper":
+        return kind, merged
+    if hf_kind == "reference":
+        return "auto", merged
+    if hf_kind == "file":
+        return "file", merged
+    if kind in (None, "repo", "project"):
+        return "repo", merged
+    return kind, merged
 
 
 def is_pdf_landing_page(url: str) -> bool:
@@ -277,6 +446,13 @@ def classify_generic(url: str) -> tuple[str, dict]:
             f"{m.group('repo')}/{m.group('branch')}/{m.group('path')}"
         )
         return "file", {"raw_url": raw_url}
+
+    hf = classify_hf_url(url)
+    if hf is not None:
+        kind, meta = hf
+        if kind == "reference":
+            return "auto", meta
+        return kind, meta
 
     if detect_repo_host(url):
         return "repo", {}
@@ -354,7 +530,7 @@ class Downloader:
         self.forced_branch = forced_branch
         self.hf_max_file_bytes = hf_max_file_mb * 1024 * 1024
         self.hf_max_file_mb = hf_max_file_mb
-        for sub in ("papers", "projects", "files", "html"):
+        for sub in ("papers", "projects", "files", "html", *HF_CATEGORY_DIRS.values()):
             (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # ---- [[paper]] -> pdf ---------------------------------------------------
@@ -412,11 +588,14 @@ class Downloader:
         item.meta["branch"] = branch
 
     def _download_hf_zip(self, item: LinkItem) -> None:
-        info = parse_hf_repo(item.url)
+        info = item.meta.get("hf_info") or parse_hf_repo(item.url)
         if info is None:
             raise ValueError(f"Could not parse a Hugging Face repo id from: {item.url}")
 
-        revision = self.forced_branch or info["revision"] or "main"
+        category = item.meta.get("hf_category") or info.get("repo_type", "model")
+        out_subdir = HF_CATEGORY_DIRS.get(category, "projects")
+
+        revision = self.forced_branch or info.get("revision") or "main"
         api_url = f"https://huggingface.co/api/{info['api_prefix']}/{info['repo_id']}"
         if revision != "main":
             api_url += f"/revision/{revision}"
@@ -424,7 +603,10 @@ class Downloader:
         r.raise_for_status()
         siblings = r.json().get("siblings", [])
         if not siblings:
-            raise ValueError(f"No files listed for Hugging Face repo {info['repo_id']} (gated, private, or empty?)")
+            raise ValueError(
+                f"No files listed for Hugging Face {category} {info['repo_id']} "
+                "(gated, private, or empty?)"
+            )
 
         included, skipped = [], []
         with tempfile.TemporaryDirectory() as tmp:
@@ -433,13 +615,18 @@ class Downloader:
                 rfilename = sib.get("rfilename")
                 if not rfilename:
                     continue
-                file_url = f"https://huggingface.co/{info['url_prefix']}{info['repo_id']}/resolve/{revision}/{rfilename}"
+                file_url = (
+                    f"https://huggingface.co/{info['url_prefix']}{info['repo_id']}"
+                    f"/resolve/{revision}/{rfilename}"
+                )
                 try:
                     with requests.get(file_url, headers=DEFAULT_HEADERS, stream=True,
                                        timeout=self.timeout, allow_redirects=True) as fr:
                         fr.raise_for_status()
                         size = int(fr.headers.get("Content-Length") or 0)
-                        if size > self.hf_max_file_bytes:
+                        if not should_include_hf_file(
+                            rfilename, size, category, self.hf_max_file_bytes,
+                        ):
                             skipped.append(rfilename)
                             continue
                         dest_file = tmp_path / rfilename
@@ -450,27 +637,34 @@ class Downloader:
                                     f.write(chunk)
                         included.append(rfilename)
                 except requests.RequestException as exc:
-                    log.warning("  -> failed to fetch %s from %s (%s), skipping that file", rfilename, info["repo_id"], exc)
+                    log.warning(
+                        "  -> failed to fetch %s from %s (%s), skipping that file",
+                        rfilename, info["repo_id"], exc,
+                    )
                     skipped.append(rfilename)
 
             if not included:
-                raise ValueError(f"All files in {info['repo_id']} were skipped (too large or failed) -- nothing to zip")
+                raise ValueError(
+                    f"All files in {info['repo_id']} were skipped for {category} "
+                    f"(filtered or over {self.hf_max_file_mb}MB) -- nothing to zip"
+                )
 
             safe_name = sanitize(info["repo_id"].replace("/", "__"))
-            filename = f"{safe_name}__{revision}__hf.zip"
-            dest = unique_path(self.out_dir / "projects", filename)
+            filename = f"{safe_name}__{revision}__{category}.zip"
+            dest = unique_path(self.out_dir / out_subdir, filename)
             with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
                 for rel in included:
                     zf.write(tmp_path / rel, arcname=rel)
 
         item.local_path = dest
+        item.meta["hf_category"] = category
         item.meta["revision"] = revision
         item.meta["files_included"] = len(included)
         item.meta["files_skipped"] = len(skipped)
         if skipped:
             log.info(
-                "  -> %s: zipped %d file(s), skipped %d over %dMB cap (--hf-max-file-mb to change), e.g. %s",
-                item.url, len(included), len(skipped), self.hf_max_file_mb, skipped[0],
+                "  -> HF %s %s: zipped %d file(s), skipped %d (%s filter/size), e.g. %s",
+                category, item.url, len(included), len(skipped), category, skipped[0],
             )
 
     # ---- known-extension file -------------------------------------------------
@@ -585,43 +779,175 @@ def rewrite_markdown(md_text: str, all_links: list[dict], url_to_rel: dict[str, 
 
 
 # --------------------------------------------------------------------------
-# Main
+# Input parsing and path resolution
 # --------------------------------------------------------------------------
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("md_file", help="Path to the input markdown file")
-    parser.add_argument("output_dir", nargs="?", default=None,
-                         help="New directory to create. Will contain a local copy of the "
-                              "markdown file (links rewritten to point locally) plus a "
-                              "downloads/ folder with the actual downloaded content. "
-                              "Not required with --dry-run.")
-    parser.add_argument("--workers", type=int, default=6, help="Concurrent downloads")
-    parser.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN"),
-                         help="GitHub token to raise API/rate limits (or set GITHUB_TOKEN env var)")
-    parser.add_argument("--branch", default=None,
-                         help="Force this branch/revision for ALL repo links (github and huggingface)")
-    parser.add_argument("--hf-max-file-mb", type=int, default=200,
-                         help="Skip individual files in a Hugging Face repo larger than this "
-                              "many MB (e.g. model weights) when building its zip. Default 200.")
-    parser.add_argument("--timeout", type=int, default=30, help="Per-request timeout (s)")
-    parser.add_argument("--dry-run", action="store_true",
-                         help="Only show classification, don't download anything")
-    parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+def split_input_tokens(raw: str) -> list[str]:
+    """Split on comma (optional following space), respecting single/double quotes."""
+    tokens: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                current.append(ch)
+        elif ch in "'\"":
+            quote = ch
+        elif ch == ",":
+            tok = "".join(current).strip()
+            if tok:
+                tokens.append(tok)
+            current = []
+            if i + 1 < len(raw) and raw[i + 1] == " ":
+                i += 1
+        else:
+            current.append(ch)
+        i += 1
+    tok = "".join(current).strip()
+    if tok:
+        tokens.append(tok)
+    return tokens
 
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s")
 
-    md_path = Path(args.md_file)
-    if not md_path.exists():
-        log.error("File not found: %s", md_path)
-        return 1
-    if not args.dry_run and not args.output_dir:
-        log.error("output_dir is required (only optional together with --dry-run)")
-        return 1
+def find_md_in_folder(folder: Path) -> Path:
+    folder = folder.resolve()
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Directory not found: {folder}")
+
+    def try_folder(target: Path) -> Path | None:
+        for name in ("README.md", "readme.md", "Readme.md"):
+            candidate = target / name
+            if candidate.is_file():
+                return candidate
+        mds = sorted(target.glob("*.md"))
+        if len(mds) == 1:
+            return mds[0]
+        return None
+
+    found = try_folder(folder)
+    if found is not None:
+        return found
+
+    children = [p for p in folder.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    if len(children) == 1:
+        found = try_folder(children[0])
+        if found is not None:
+            return found
+
+    readmes = sorted(p for p in folder.rglob("*.md") if p.name.lower() == "readme.md")
+    if len(readmes) == 1:
+        return readmes[0]
+
+    mds = sorted(folder.rglob("*.md"))
+    if len(mds) == 1:
+        return mds[0]
+    if not mds:
+        raise FileNotFoundError(f"No .md file found in {folder}")
+    names = ", ".join(m.relative_to(folder).as_posix() for m in mds[:8])
+    suffix = "..." if len(mds) > 8 else ""
+    raise ValueError(f"Multiple .md files in {folder}, specify one: {names}{suffix}")
+
+
+def resolve_input(token: str, cwd: Path | None = None) -> ResolvedInput:
+    """Resolve a token to a markdown file.
+
+    Accepts: a .md file, a folder containing a .md, an existing .zip (extracted
+    and searched for README.md), or a .zip name with no file (folder with same stem).
+    """
+    cwd = cwd or Path.cwd()
+    token = token.strip()
+    if not token:
+        raise ValueError("empty input token")
+
+    path = Path(token)
+    candidates = [path]
+    if not path.is_absolute():
+        candidates.insert(0, cwd / path)
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve()
+
+        if resolved.is_file() and resolved.suffix.lower() == ".zip":
+            extract_dir = Path(tempfile.mkdtemp(prefix="md_downloader_src_"))
+            with zipfile.ZipFile(resolved, "r") as zf:
+                zf.extractall(extract_dir)
+            md_path = find_md_in_folder(extract_dir)
+            log.info("Extracted %s -> %s", resolved.name, md_path)
+            return ResolvedInput(
+                md_path=md_path,
+                source_zip=resolved,
+                cleanup_dirs=[extract_dir],
+            )
+
+        if resolved.is_file() and resolved.suffix.lower() == ".md":
+            return ResolvedInput(md_path=resolved)
+
+        if resolved.is_dir():
+            return ResolvedInput(md_path=find_md_in_folder(resolved))
+
+    if path.suffix.lower() == ".zip":
+        folder = path.with_suffix("")
+        if not folder.is_absolute():
+            folder = cwd / folder
+        if folder.is_dir():
+            return ResolvedInput(md_path=find_md_in_folder(folder.resolve()))
+
+    raise FileNotFoundError(f"Could not resolve markdown from: {token!r}")
+
+
+def resolve_input_paths(raw: str, cwd: Path | None = None) -> list[ResolvedInput]:
+    cwd = cwd or Path.cwd()
+    seen: set[Path] = set()
+    inputs: list[ResolvedInput] = []
+    for token in split_input_tokens(raw):
+        resolved = resolve_input(token, cwd)
+        key = resolved.md_path.resolve()
+        if key not in seen:
+            seen.add(key)
+            inputs.append(resolved)
+    return inputs
+
+
+def default_zip_path(resolved: ResolvedInput) -> Path:
+    """Zip named after the source folder or input .zip, with _1 suffix, beside that folder."""
+    if resolved.source_zip is not None:
+        src = resolved.source_zip.resolve()
+        return src.parent / f"{src.stem}_1.zip"
+    parent = resolved.md_path.parent.resolve()
+    return parent.parent / f"{parent.name}_1.zip"
+
+
+def zip_output_dir(out_dir: Path, zip_path: Path) -> None:
+    zip_path = zip_path.resolve()
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(out_dir.rglob("*")):
+            if file_path.is_file():
+                zf.write(file_path, arcname=file_path.relative_to(out_dir).as_posix())
+
+
+# --------------------------------------------------------------------------
+# Per-file processing
+# --------------------------------------------------------------------------
+
+def process_markdown(
+    md_path: Path,
+    out_dir: Path,
+    *,
+    workers: int,
+    github_token: str | None,
+    timeout: int,
+    branch: str | None,
+    hf_max_file_mb: int,
+    dry_run: bool,
+) -> int:
     md_text = md_path.read_text(encoding="utf-8")
-
     all_links = extract_all_links(md_text)
 
     items_by_url: dict[str, LinkItem] = {}
@@ -629,7 +955,8 @@ def main() -> int:
         if lk["url"] in items_by_url:
             continue
         if lk["kind"] is not None:
-            items_by_url[lk["url"]] = LinkItem(url=lk["url"], kind=lk["kind"])
+            kind, meta = apply_hf_classification(lk["url"], lk["kind"], {})
+            items_by_url[lk["url"]] = LinkItem(url=lk["url"], kind=kind, meta=meta)
         else:
             kind, meta = classify_generic(lk["url"])
             items_by_url[lk["url"]] = LinkItem(url=lk["url"], kind=kind, meta=meta)
@@ -640,20 +967,19 @@ def main() -> int:
         return 0
 
     counts = Counter(i.kind for i in items)
-    log.info("Found %d link(s): %s", len(items), ", ".join(f"{v} {k}" for k, v in counts.items()))
+    log.info("Found %d link(s) in %s: %s", len(items), md_path, ", ".join(f"{v} {k}" for k, v in counts.items()))
 
-    if args.dry_run:
+    if dry_run:
         for i in items:
             print(f"  [{i.kind:9s}] {i.url}")
         return 0
 
-    out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     downloads_dir = out_dir / "downloads"
-    downloader = Downloader(downloads_dir, args.github_token, args.timeout, args.branch, args.hf_max_file_mb)
+    downloader = Downloader(downloads_dir, github_token, timeout, branch, hf_max_file_mb)
 
     downloadable = [i for i in items if i.kind != "skip"]
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(downloader.run, item): item for item in downloadable}
         for _ in as_completed(futures):
             pass
@@ -679,12 +1005,146 @@ def main() -> int:
 
     ok = sum(1 for i in items if i.status == "ok")
     err = sum(1 for i in items if i.status == "error")
-    log.info("\nDone. %d downloaded, %d failed.", ok, err)
-    log.info("Project dir         -> %s", out_dir)
-    log.info("Local markdown      -> %s", output_md)
-    log.info("Downloaded content  -> %s", downloads_dir)
-    log.info("Manifest            -> %s", manifest_path)
+    log.info("Done %s: %d downloaded, %d failed.", md_path.name, ok, err)
+    log.info("  Project dir        -> %s", out_dir)
+    log.info("  Local markdown     -> %s", output_md)
+    log.info("  Downloaded content -> %s", downloads_dir)
+    log.info("  Manifest           -> %s", manifest_path)
     return 0 if err == 0 else 2
+
+
+def process_one_input(
+    resolved: ResolvedInput,
+    *,
+    output_dir: str | None,
+    multi_input: bool,
+    workers: int,
+    github_token: str | None,
+    timeout: int,
+    branch: str | None,
+    hf_max_file_mb: int,
+    dry_run: bool,
+) -> int:
+    md_path = resolved.md_path
+    log.info("=== %s ===", resolved.output_basename())
+
+    zip_path: Path | None = None
+    staging_dir: Path | None = None
+    try:
+        if dry_run:
+            out_dir = Path(output_dir) if output_dir else md_path.parent
+        elif output_dir:
+            base = Path(output_dir)
+            out_dir = base if not multi_input else base / resolved.output_basename()
+        else:
+            staging_dir = Path(tempfile.mkdtemp(prefix="md_downloader_"))
+            out_dir = staging_dir
+            zip_path = default_zip_path(resolved)
+
+        code = process_markdown(
+            md_path,
+            out_dir,
+            workers=workers,
+            github_token=github_token,
+            timeout=timeout,
+            branch=branch,
+            hf_max_file_mb=hf_max_file_mb,
+            dry_run=dry_run,
+        )
+
+        if staging_dir is not None and zip_path is not None:
+            zip_output_dir(staging_dir, zip_path)
+            shutil.rmtree(staging_dir)
+            staging_dir = None
+            log.info("  Result zip         -> %s", zip_path)
+
+        return code
+    finally:
+        for cleanup_dir in resolved.cleanup_dirs:
+            if cleanup_dir.exists():
+                shutil.rmtree(cleanup_dir, ignore_errors=True)
+        if staging_dir is not None and staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__,
+                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "md_file",
+        help="One or more inputs, comma-separated (quote with ' or \" to protect commas). "
+             "Each item may be a .md file, a folder containing a .md, an existing .zip "
+             "(extracted and searched for README.md), or a .zip name with no file "
+             "(resolved to the folder with the same stem).",
+    )
+    parser.add_argument("output_dir", nargs="?", default=None,
+                         help="Directory to write results into. If omitted, each input is "
+                              "processed into a temporary folder and saved as a .zip named "
+                              "after the markdown's parent folder, placed beside that folder. "
+                              "Not required with --dry-run.")
+    parser.add_argument("--workers", type=int, default=6,
+                         help="Concurrent downloads per input file")
+    parser.add_argument("--jobs", type=int, default=0,
+                         help="Input files to process in parallel (default: all inputs at once)")
+    parser.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN"),
+                         help="GitHub token to raise API/rate limits (or set GITHUB_TOKEN env var)")
+    parser.add_argument("--branch", default=None,
+                         help="Force this branch/revision for ALL repo links (github and huggingface)")
+    parser.add_argument("--hf-max-file-mb", type=int, default=200,
+                         help="Skip individual files in a Hugging Face repo larger than this "
+                              "many MB (e.g. model weights) when building its zip. Default 200.")
+    parser.add_argument("--timeout", type=int, default=30, help="Per-request timeout (s)")
+    parser.add_argument("--dry-run", action="store_true",
+                         help="Only show classification, don't download anything")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(message)s")
+
+    try:
+        inputs = resolve_input_paths(args.md_file)
+    except (FileNotFoundError, ValueError) as exc:
+        log.error("%s", exc)
+        return 1
+
+    if not inputs:
+        log.error("No markdown inputs resolved from: %s", args.md_file)
+        return 1
+
+    file_jobs = args.jobs if args.jobs > 0 else len(inputs)
+    file_jobs = max(1, min(file_jobs, len(inputs)))
+    multi_input = len(inputs) > 1
+
+    if file_jobs > 1:
+        log.info("Processing %d input(s) with %d parallel job(s), %d download worker(s) each",
+                 len(inputs), file_jobs, args.workers)
+
+    common = dict(
+        output_dir=args.output_dir,
+        multi_input=multi_input,
+        workers=args.workers,
+        github_token=args.github_token,
+        timeout=args.timeout,
+        branch=args.branch,
+        hf_max_file_mb=args.hf_max_file_mb,
+        dry_run=args.dry_run,
+    )
+
+    exit_code = 0
+    if file_jobs == 1:
+        for resolved in inputs:
+            exit_code = max(exit_code, process_one_input(resolved, **common))
+    else:
+        with ThreadPoolExecutor(max_workers=file_jobs) as pool:
+            futures = [pool.submit(process_one_input, resolved, **common) for resolved in inputs]
+            for fut in as_completed(futures):
+                exit_code = max(exit_code, fut.result())
+
+    return exit_code
 
 
 if __name__ == "__main__":
